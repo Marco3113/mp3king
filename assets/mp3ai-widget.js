@@ -831,7 +831,16 @@ You can take real actions inside mp3king on behalf of the user. When the user as
       const match = full.match(ACTION_RE);
       if (match) {
         text = full.replace(ACTION_RE, "").trim();
-        try { pendingAction = JSON.parse(match[1].trim()); } catch {}
+        let raw = match[1].trim();
+        // Strip markdown code fences (```json ... ``` or ``` ... ```) some models add
+        raw = raw.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+        try {
+          pendingAction = JSON.parse(raw);
+        } catch {
+          // Last resort: grab the first {...} block in case there's stray text around it
+          const objMatch = raw.match(/\{[\s\S]*\}/);
+          if (objMatch) { try { pendingAction = JSON.parse(objMatch[0]); } catch {} }
+        }
       }
 
       const s2 = loadStore(), c2 = getActiveChat(s2);
