@@ -1,5 +1,3 @@
-// Vercel Edge Function — YouTube audio resolver via Invidious
-// Server-side: tries all known instances, client hits one stable URL
 export const config = { runtime: 'edge' };
 
 const INVIDIOUS = [
@@ -11,7 +9,6 @@ const INVIDIOUS = [
   'https://invidious.f5.si',
 ];
 
-// Also try Piped as a secondary fallback
 const PIPED = [
   'https://pipedapi.kavin.rocks',
   'https://api.piped.yt',
@@ -20,34 +17,71 @@ const PIPED = [
 
 export default async function handler(req) {
   const { searchParams } = new URL(req.url);
-  const title  = (searchParams.get('title')   || '').trim();
-  const artist = (searchParams.get('artist')  || '').trim();
-  const vid    = (searchParams.get('videoId') || '').trim();
+  const title   = (searchParams.get('title')   || '').trim();
+  const artist  = (searchParams.get('artist')  || '').trim();
+  const vidParam = (searchParams.get('videoId') || '').trim();
+  const stream  = searchParams.get('stream') === '1';
 
-  if (!title && !vid) return err('Missing title or videoId', 400);
+  // /api/yt-audio?stream=1&url=<encoded> — proxy the audio bytes
+  if (stream) {
+    const rawUrl = searchParams.get('url');
+    if (!rawUrl) return err('Missing url param', 400);
+    try {
+      const upstream = await fetch(decodeURIComponent(rawUrl), {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1)',
+          'Referer': 'https://www.youtube.com/',
+          'Origin': 'https://www.youtube.com',
+        },
+        signal: AbortSignal.timeout(30000),
+      });
+      if (!upstream.ok) return err(`Upstream ${upstream.status}`, 502);
+      return new Response(upstream.body, {
+        status: 200,
+        headers: {
+          'Content-Type': upstream.headers.get('Content-Type') || 'audio/webm',
+          'Content-Length': upstream.headers.get('Content-Length') || '',
+          'Accept-Ranges': 'bytes',
+          'Access-Control-Allow-Origin': '*',
+          'Cache-Control': 'no-store',
+        },
+      });
+    } catch (e) {
+      return err(e.message, 502);
+    }
+  }
+
+  if (!title && !vidParam) return err('Missing title or videoId', 400);
 
   try {
-    // If videoId provided directly, skip search
-    const videoId = vid || await searchVideoId(title, artist);
+    const videoId = vidParam || await searchVideoId(title, artist);
     if (!videoId) return err('No YouTube results found', 404);
     if (!/^[\w-]{11}$/.test(videoId)) return err('Invalid videoId', 400);
 
-    // Try Invidious instances for streams
     const audio = await getAudioFromInvidious(videoId)
                || await getAudioFromPiped(videoId);
 
     if (!audio) return err('Could not extract audio stream', 502);
 
-    return json({ ...audio, videoId });
+    // Proxy the stream URL through this function so the IP matches
+    const proxyUrl = `/api/yt-audio?stream=1&url=${encodeURIComponent(audio.rawUrl)}`;
+
+    return json({
+      url: proxyUrl,
+      title: audio.title || title,
+      artist: audio.artist || artist,
+      duration: audio.duration || 0,
+      videoId,
+      source: 'youtube',
+    });
   } catch (e) {
     return err(e.message || 'Unknown error', 500);
   }
 }
 
 async function searchVideoId(title, artist) {
-  const q = artist ? `${title} ${artist} official audio` : `${title} official audio`;
+  const q = artist ? `${title} ${artist} audio` : `${title} audio`;
 
-  // Try Invidious search first
   for (const base of INVIDIOUS) {
     try {
       const res = await fetch(
@@ -62,7 +96,6 @@ async function searchVideoId(title, artist) {
     } catch { continue; }
   }
 
-  // Try Piped search as fallback
   for (const base of PIPED) {
     try {
       const res = await fetch(
@@ -95,11 +128,10 @@ async function getAudioFromInvidious(videoId) {
         .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
       if (!streams.length) continue;
       return {
-        url: streams[0].url,
+        rawUrl: streams[0].url,
         title: data.title || '',
         artist: data.author || '',
         duration: data.lengthSeconds || 0,
-        source: 'youtube',
       };
     } catch { continue; }
   }
@@ -120,11 +152,10 @@ async function getAudioFromPiped(videoId) {
         .sort((x, y) => (y.bitrate || 0) - (x.bitrate || 0));
       if (!streams.length) continue;
       return {
-        url: streams[0].url,
+        rawUrl: streams[0].url,
         title: data.title || '',
         artist: data.uploader || '',
         duration: data.duration || 0,
-        source: 'youtube',
       };
     } catch { continue; }
   }
